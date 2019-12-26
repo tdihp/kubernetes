@@ -88,7 +88,7 @@ func newAzureAuthProvider(_ string, cfg map[string]string, persister restclient.
 	if err != nil {
 		return nil, fmt.Errorf("creating a new azure token source for device code authentication: %v", err)
 	}
-	cacheSource := newAzureTokenSource(ts, cache, cfg, persister)
+	cacheSource := newAzureTokenSource(ts, cache, cfg, persister, azureTokenRefresher{})
 
 	return &azureAuthProvider{
 		tokenSource: cacheSource,
@@ -155,20 +155,28 @@ type tokenSource interface {
 	Token() (*azureToken, error)
 }
 
+type tokenRefresher interface {
+	refreshToken(*azureToken) (*azureToken, error)
+}
+
 type azureTokenSource struct {
 	source    tokenSource
 	cache     *azureTokenCache
 	lock      sync.Mutex
 	cfg       map[string]string
 	persister restclient.AuthProviderConfigPersister
+	refresher tokenRefresher
 }
 
-func newAzureTokenSource(source tokenSource, cache *azureTokenCache, cfg map[string]string, persister restclient.AuthProviderConfigPersister) tokenSource {
+type azureTokenRefresher struct{}
+
+func newAzureTokenSource(source tokenSource, cache *azureTokenCache, cfg map[string]string, persister restclient.AuthProviderConfigPersister, refresher tokenRefresher) tokenSource {
 	return &azureTokenSource{
 		source:    source,
 		cache:     cache,
 		cfg:       cfg,
 		persister: persister,
+		refresher: refresher,
 	}
 }
 
@@ -180,34 +188,59 @@ func (ts *azureTokenSource) Token() (*azureToken, error) {
 	defer ts.lock.Unlock()
 
 	var err error
+	// 1. use cache if available
 	token := ts.cache.getToken(azureTokenKey)
+
+	// 2. load persist if no cache
 	if token == nil {
 		token, err = ts.retrieveTokenFromCfg()
-		if err != nil {
-			token, err = ts.source.Token()
-			if err != nil {
-				return nil, fmt.Errorf("acquiring a new fresh token: %v", err)
-			}
-		}
-		if !token.token.IsExpired() {
+
+		// set cfg to cache 
+		if err == nil {
+			klog.V(4).Info("Saving cache after load cfg")
 			ts.cache.setToken(azureTokenKey, token)
-			err = ts.storeTokenInCfg(token)
-			if err != nil {
-				return nil, fmt.Errorf("storing the token in configuration: %v", err)
-			}
 		}
 	}
-	if token.token.IsExpired() {
+	
+	// quick exit for caching scenario
+	if token != nil && !token.token.IsExpired() {
+		return token, nil
+	}
+
+	// 3. extend if valid token but expired
+	if token != nil && token.token.IsExpired() {
+		klog.V(4).Info("Refreshing token.")
 		token, err = ts.refreshToken(token)
 		if err != nil {
-			return nil, fmt.Errorf("refreshing the expired token: %v", err)
-		}
-		ts.cache.setToken(azureTokenKey, token)
-		err = ts.storeTokenInCfg(token)
-		if err != nil {
-			return nil, fmt.Errorf("storing the refreshed token in configuration: %v", err)
+			if _, ok := err.(adal.TokenRefreshError); ok {
+				// When refreshToken fails, token will be reset to nil
+				// so that the inner token source will be used to acquire new
+				klog.V(4).Infof("Failed to refresh expired token, proceed to auth: %v", err)
+			} else {
+				return nil, fmt.Errorf("Unexpected error when refreshing token: %v", err)
+			}
 		}
 	}
+
+	// 4. real-auth if invalid token
+	if token == nil {
+		token, err = ts.source.Token()
+		if err != nil {
+			return nil, fmt.Errorf("Failed acquiring new fresh token: %v", err)
+		}
+		// corner condition, newly got token is valid but expired
+		if token.token.IsExpired() {
+			return nil, fmt.Errorf("Newly acquired token is expired")
+		}
+	}
+
+	// 5. save cache & config
+	ts.cache.setToken(azureTokenKey, token)
+	err = ts.storeTokenInCfg(token)
+	if err != nil {
+		return nil, fmt.Errorf("storing the refreshed token in configuration: %v", err)
+	}
+
 	return token, nil
 }
 
@@ -281,7 +314,9 @@ func (ts *azureTokenSource) storeTokenInCfg(token *azureToken) error {
 	return nil
 }
 
-func (ts *azureTokenSource) refreshToken(token *azureToken) (*azureToken, error) {
+// refresh outdated token with adal.
+// adal.RefreshTokenError will be returned if error occur during refreshing.
+func (azureTokenRefresher) refreshToken(token* azureToken) (*azureToken, error) {
 	env, err := azure.EnvironmentFromName(token.environment)
 	if err != nil {
 		return nil, err
@@ -316,6 +351,10 @@ func (ts *azureTokenSource) refreshToken(token *azureToken) (*azureToken, error)
 		tenantID:    token.tenantID,
 		apiserverID: token.apiserverID,
 	}, nil
+}
+
+func (ts *azureTokenSource) refreshToken(token *azureToken) (*azureToken, error) {
+	return ts.refresher.refreshToken(token)
 }
 
 type azureTokenSourceDeviceCode struct {
